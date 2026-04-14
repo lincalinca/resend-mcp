@@ -17,10 +17,15 @@ export function addEditorTools(
 ) {
   let activeConnection: EditorConnection | null = null;
 
+  /** MCP client name (e.g. "claude-code", "cursor") used as the agent_name for editor presence. */
+  function getAgentName(): string | undefined {
+    return server.server.getClientVersion()?.name;
+  }
+
   /**
-   * Connect to the editor for a resource, perform an async action, then
-   * disconnect. Used internally by broadcast tools so the AI avatar shows
-   * up automatically whenever content is pushed.
+   * Run an async action and then disconnect from the editor.
+   * If get-tiptap-json-content already established a connection, reuse it;
+   * otherwise connect first so compose-* still works standalone.
    */
   async function withEditorSession<T>(
     conn: EditorConnection,
@@ -30,18 +35,26 @@ export function addEditorTools(
       return fn();
     }
 
-    try {
-      await apiClient.createEditorConnection(conn);
-      activeConnection = conn;
-    } catch {
-      // best-effort — proceed even if connect fails
+    const alreadyConnected =
+      activeConnection &&
+      activeConnection.resource_type === conn.resource_type &&
+      activeConnection.resource_id === conn.resource_id;
+
+    if (!alreadyConnected) {
+      try {
+        const agent_name = conn.agent_name ?? getAgentName();
+        await apiClient.createEditorConnection({ ...conn, agent_name });
+        activeConnection = { ...conn, agent_name };
+      } catch {
+        // best-effort — proceed even if connect fails
+      }
     }
 
     try {
       return await fn();
     } finally {
       try {
-        await apiClient.deleteEditorConnection(conn);
+        await apiClient.deleteEditorConnection(activeConnection ?? conn);
       } catch {
         // best-effort
       }
@@ -53,7 +66,7 @@ export function addEditorTools(
     'get-tiptap-json-content',
     {
       title: 'Get TipTap JSON Content',
-      description: `**Purpose:** Retrieve the existing TipTap JSON content of a broadcast or template, optionally bundled with the TipTap schema reference.
+      description: `**Purpose:** Retrieve the existing TipTap JSON content of a broadcast or template, optionally bundled with the TipTap schema reference. Also connects the agent to the editor so the avatar is visible while content is being generated.
 
 **When to use:**
 - **Always call this before compose-broadcast or compose-template** to fetch the current document state — even if you expect it to be empty, the resource may have content set via the dashboard
@@ -61,6 +74,8 @@ export function addEditorTools(
 - To inspect the current TipTap structure of a resource
 
 **Returns:** The TipTap JSON content object for the resource, and optionally the TipTap schema. Use the content as the base for modifications, then pass the updated JSON to compose-broadcast or compose-template.
+
+**Note:** This tool automatically connects the agent to the editor. The subsequent compose-broadcast or compose-template call will disconnect when done.
 
 **Tip:** Set include_schema to true to get both the existing content and the schema in one call.`,
       inputSchema: {
@@ -86,6 +101,28 @@ export function addEditorTools(
         rawResourceId,
         resource_type === 'broadcast' ? 'broadcasts' : 'templates',
       );
+
+      // Connect early so the agent avatar is visible while the LLM
+      // generates content between this call and compose-*.
+      // Skip if connect-to-editor was already called for this resource.
+      if (
+        !activeConnection ||
+        activeConnection.resource_type !== resource_type ||
+        activeConnection.resource_id !== resource_id
+      ) {
+        const agent_name = getAgentName();
+        try {
+          await apiClient.createEditorConnection({
+            resource_type,
+            resource_id,
+            agent_name,
+          });
+          activeConnection = { resource_type, resource_id, agent_name };
+        } catch {
+          // best-effort — proceed even if connect fails
+        }
+      }
+
       const contentParts: Array<{ type: 'text'; text: string }> = [];
 
       const result = await apiClient.getEditorContent(
@@ -124,8 +161,8 @@ export function addEditorTools(
       description: `**Purpose:** Show agent presence in the Resend dashboard editor. Users will see an agent avatar while connected.
 
 **When to use:**
-- To signal to dashboard users that an AI agent is working on the content
-- **Not needed before compose-broadcast or compose-template** — those tools handle editor connection automatically. Only call this for manual editor presence outside of compose workflows.
+- To signal to dashboard users that an AI agent is working on the content outside of compose workflows
+- **Not needed before compose-broadcast or compose-template** — get-tiptap-json-content connects automatically, and compose tools disconnect when done.
 
 **Returns:** Connection token and room ID.`,
       inputSchema: {
@@ -154,13 +191,19 @@ export function addEditorTools(
         resource_type === 'broadcast' ? 'broadcasts' : 'templates',
       );
 
+      const resolvedAgentName = agent_name ?? getAgentName();
+
       const result = await apiClient.createEditorConnection({
         resource_type,
         resource_id,
-        agent_name,
+        agent_name: resolvedAgentName,
       });
 
-      activeConnection = { resource_type, resource_id, agent_name };
+      activeConnection = {
+        resource_type,
+        resource_id,
+        agent_name: resolvedAgentName,
+      };
 
       return {
         content: [
