@@ -1,6 +1,6 @@
 #!/usr/bin/env node
+import './bootstrap-env.js';
 import './user-agent.js';
-import 'dotenv/config';
 import { Resend } from 'resend';
 import { parseArgs, resolveConfigOrExit } from './cli/index.js';
 import { runHttp } from './transports/http.js';
